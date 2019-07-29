@@ -1,5 +1,5 @@
 [package]
-name = "chat"
+name = "hubbub"
 version = "0.1.0"
 authors = ["nicename"]
 edition = "2018"
