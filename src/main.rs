@@ -1,76 +1,52 @@
 extern crate ws;
 use ws::{listen, Handler, Sender, Result, Message, Handshake, CloseCode, Error};
+use serde::{Deserialize, Serialize};
+use serde_json::Result as jsResult;
+use std::rc::Rc;
+use std::cell::RefCell;
 extern crate chrono;
 use chrono::prelude::*;
-use std::rc::Rc;
-use std::cell::Cell;
-extern crate rustc_serialize;
-use rustc_serialize::json::Json;
+use std::fs::File;
+use std::io::prelude::*;
 
-//Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
-
-struct Server<'a> {
-	out: Sender,
-	count: Rc<Cell<usize>>,
-	hubbub: &'a Hubbub,
+fn main() {
+	let mut users: Rc<RefCell<Vec<User>>> = Rc::new(RefCell::new(vec!()));
+	let mut conversations: Rc<RefCell<Vec<Rc<RefCell<Conversation>>>>> = Rc::new(RefCell::new(vec!()));
+	listen("0.0.0.0:30012", |out| Server { out: out, users: users.clone(), conversations: conversations.clone() }).unwrap();
 }
 
-impl<'a> Handler for Server<'a> {
+struct Server {
+	out: Sender,
+	users: Rc<RefCell<Vec<User>>>,
+	conversations: Rc<RefCell<Vec<Rc<RefCell<Conversation>>>>>,
+}
+
+//Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
+impl Handler for Server {
 	
 	fn on_open(&mut self, hs: ws::Handshake) -> Result<()> {
 		println!("Client connection established.");
 		println!("{:?}", self.out.token());
-		Ok(self.count.set(self.count.get() + 1))
+		// self.out.send(self.count.get());
+		Ok(())
 	}
 	
 	fn on_message(&mut self, msg: Message) -> Result<()> {
-		if let Some(data) = Json::from_str(&msg.to_string()).unwrap().as_object() {
-			if let Some(convo) = data.get("convo").unwrap().as_u64() {
-				if let Some(convo) = &self.hubbub.get_convo(convo as usize) {
-					let buff = &convo.buffer;
-					if let Some(cmd) = data.get("cmd").unwrap().as_string() {
-						if let Some(txt) = data.get("txt").unwrap().as_string() {
-							if let Some(start) = data.get("start").unwrap().as_u64() {
-								let start = start as usize;
-								if let Some(end) = data.get("end").unwrap().as_u64() {
-									let end = end as usize;
-									match cmd {
-										"Replace" => {
-											if let Some(first) = buff.get(0..start) {
-												if let Some(third) = buff.get(end..buff.len()) {
-													let whole = format!("{}{}{}", first, txt, third);
-													// self.buff = whole;
-												}
-											}
-										},
-										"MoveCursor" => {
-										},
-										"RequestConvo" => {
-											
-										}
-										_ => (),
-									}
-								}
-							}
-						}
-					}
-				}
-			}
-		}
-		// self.out.send(format!("{{ \"text\": \"{}\" }}", msg))
-		self.out.close(CloseCode::Normal);
+		// self.out.send(format!("{{ \"text\": \"{}\" }}", msg));
+		let decoded: Demessage = serde_json::from_str(&msg.to_string()).unwrap();
+		self.handle_msg(decoded);
+		// self.out.broadcast(msg);
 		Ok(())
 	}
 	
 	fn on_close(&mut self, code: CloseCode, reason: &str) {
+		self.remove_user(self.out.token());
 		match code {
 			CloseCode::Normal => println!("The client is done with the connection."),
 			CloseCode::Away => println!("The client is leaving the site."),
 			CloseCode::Abnormal => println!("Closing handshake failed. Unable to obtain closing status from client."),
 			_ => println!("The client encountered an error (CloseCode: {:?}): {}", code, reason),
 		}
-		
-		self.count.set(self.count.get() - 1)
 	}
 	
 	fn on_error(&mut self, err: Error) {
@@ -79,94 +55,234 @@ impl<'a> Handler for Server<'a> {
 	
 }
 
-fn main() {
-	let count = Rc::new(Cell::new(0));
-	let mut h = Hubbub::new();
-	listen("0.0.0.0:30012", |out| Server { out: out, count: count.clone(), hubbub: &mut h, }).unwrap();
-	println!("{:?}", count);
-}
-
-struct User {
-	id: usize,
-	convos: Vec<usize>,
-	owns: Vec<usize>,
-	administrates: Vec<usize>,
-}
-
-impl User {
-	pub fn new(id: usize) -> User {
-		User {
+impl Server {
+	
+	pub fn validate(self, ) -> Option<()> {
+		
+		Some(())
+	}
+	
+	pub fn add_convo(&mut self, id: usize, owner: usize) {
+		let mut convo = Rc::new(RefCell::new(Conversation {
 			id: id,
-			convos: vec!(),
-			owns: vec!(),
-			administrates: vec!(),
+			buffer: String::new(),
+			owner: owner,
+			admins: vec!(),
+			users: vec!(),
+			banned: vec!(),
+			private: true,
+		}));
+		self.conversations.borrow_mut().push(convo);
+	}
+	
+	pub fn add_user(&mut self, usrid: usize, token: ws::util::Token) {
+		
+	}
+	
+	pub fn remove_user(&mut self, token: ws::util::Token) {
+		for (i, u) in self.users.borrow_mut().iter_mut().enumerate() {
+			if u.token == token {
+				self.users.borrow_mut().remove(i);
+				break;
+			}
 		}
 	}
 	
-	pub fn add_to_convo(&mut self, id: usize) -> std::result::Result<(), String> {
-		let mut convofound = false;
-		self.convos.iter().map(|c| { if c == &id { convofound = true } });
-		if !convofound {
-			self.convos.push(id);
-			Ok(())
-		} else {
-			Err(String::from("User already in convo"))
+	pub fn id_get_user_token(&self, id: &usize) -> Option<ws::util::Token> {
+		self.users.borrow().iter().find(|u| &u.id == id).map(|u| u.token)
+	}
+	
+	fn get_convo_mut(&self, convoid: &usize) -> Option<Rc<RefCell<Conversation>>> {
+		self.conversations.borrow().iter().find(|c| c.borrow().id() == convoid).map(|c| c.clone())
+	}
+	
+	fn get_users_from_convo(&self, convoid: &usize) -> Option<Vec<usize>> {
+		self.conversations.borrow().iter().find(|c| c.borrow().id() == convoid).map(|c| c.borrow().users.clone())
+	}
+	
+	pub fn has_permission(&self, convoid: &usize, userid: &usize) -> bool {
+		self.conversations.borrow().iter().find(|c| c.borrow().id() == convoid).map(|c| c.borrow().has_permission(userid)).unwrap()
+	}
+	
+	fn send_to_all_in_convo(&self, convoid: &usize, exclude: &usize) {
+		if let Some(users) = self.get_users_from_convo(convoid) {
+			for id in users.iter() {
+				if id != exclude && self.has_permission(convoid, id) {
+					if let Some(token) = self.id_get_user_token(id) {
+						
+					}
+				}
+			}
 		}
 	}
+	
+	fn handle_msg(&mut self, msg: Demessage) -> Result<()> {
+		match &msg.cmd[..] {
+			"Replace" => {
+				if let Some(mut convo) = self.get_convo_mut(&msg.convo) {
+					if let Some(first) = convo.borrow().buffer().get(0..msg.start) {
+						if let Some(third) = convo.borrow().buffer().get(msg.end..convo.borrow().buffer().len()) {
+							let whole = format!("{}{}{}", first, msg.txt, third);
+							convo.borrow_mut().set_buffer(&msg.usrid, whole);
+						}
+					}
+				}
+			},
+			"MoveCursor" => {
+				self.send_to_all_in_convo(&msg.convo, &msg.usrid);
+			},
+			"RequestConvo" => {
+				
+			},
+			"NewUser" => {
+				self.add_user(msg.usrid, self.out.token());
+			},
+			_ => (),
+		}
+		Ok(())
+	}
+	
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct User {
+	id: usize,
+	token: ws::util::Token,
+}
+
+impl User {
+	pub fn new(id: usize, token: ws::util::Token) -> User {
+		User {
+			id: id,
+			token: token,
+		}
+	}
+	
+	pub fn id(&self) -> &usize {
+		&self.id
+	}
+	
+	pub fn token(&self) -> &ws::util::Token {
+		&self.token
+	}
+	
+}
+
+#[derive(PartialEq)]
+enum Permissions {
+	Owner,
+	Admin,
+	User,
+	Banned,
+	Apart,
 }
 
 struct Conversation {
 	id: usize,
 	buffer: String,
+	owner: usize,
+	admins: Vec<usize>,
+	users: Vec<usize>,
+	banned: Vec<usize>,
 	private: bool,
 }
 
-struct Hubbub {
-	users: Vec<User>,
-	conversations: Vec<Conversation>,
+impl Conversation {
+	
+	pub fn has_permission(&self, userid: &usize) -> bool {
+		if let Some(p) = self.get_user_permissions(userid) {
+			if p != Permissions::Banned && p != Permissions::Apart {
+				return true;
+			}
+		}
+		false
+	}
+	
+	pub fn get_user_permissions(&self, userid: &usize) -> Option<Permissions> {
+		if self.owner() == userid {
+			return Some(Permissions::Owner);
+		}
+		for i in self.banned.iter() {
+			if i == userid {
+				return Some(Permissions::Banned);
+			}
+		}
+		for i in self.admins.iter() {
+			if i == userid {
+				return Some(Permissions::Admin);
+			}
+		}
+		for i in self.users.iter() {
+			if i == userid {
+				return Some(Permissions::User);
+			}
+		}
+		Some(Permissions::Apart)
+	}
+	
+	pub fn id(&self) -> &usize {
+		&self.id
+	}
+	
+	pub fn set_buffer(&mut self, usrid: &usize, s: String) {
+		let p = self.get_user_permissions(usrid).unwrap();
+		if p != Permissions::Apart && p != Permissions::Banned {
+			self.buffer = s;
+		}
+	}
+	
+	pub fn buffer(&self) -> &String {
+		&self.buffer
+	}
+	
+	pub fn set_owner(&mut self, usrid: usize) {
+		self.owner = usrid;
+	}
+	
+	pub fn owner(&self) -> &usize {
+		&self.owner
+	}
+	
+	pub fn add_admin(&mut self, usrid: usize) {
+		self.admins.push(usrid);
+	}
+	
+	pub fn admins(&self) -> &Vec<usize> {
+		&self.admins
+	}
+	
+	pub fn add_user(&mut self, usrid: usize) {
+		self.users.push(usrid);
+	}
+	
+	pub fn users(&self) -> &Vec<usize> {
+		&self.users
+	}
+	
+	pub fn ban(&mut self, usrid: usize) {
+		self.banned.push(usrid);
+	}
+	
+	pub fn banned(&self) -> &Vec<usize> {
+		&self.banned
+	}
+	
+	pub fn toggle_private(&mut self, b: bool) {
+		self.private = b;
+	}
+	
+	pub fn private(&self) -> &bool {
+		&self.private
+	}
+	
 }
 
-impl Hubbub {
-	
-	pub fn new() -> Hubbub {
-		Hubbub {
-			users: vec!(),
-			conversations: vec!(),
-		}
-	}
-	
-	pub fn add_convo(&mut self, id: usize, owner: usize) {
-		if let Some(usr) = self.get_user(owner) {
-			let mut convo = Conversation {
-				id: id,
-				buffer: String::new(),
-				private: true,
-			};
-			usr.add_to_convo(id);
-			self.conversations.push(convo);
-		}
-	}
-	
-	fn get_convo(&mut self, id: usize) -> Option<&mut Conversation> {
-		for c in self.conversations.iter_mut() {
-			if c.id == id {
-				return Some(c);
-			}
-		}
-		None
-	}
-	
-	
-	pub fn get_user(&mut self, id: usize) -> Option<&mut User> {
-		for mut u in self.users.iter_mut() {
-			if u.id == id {
-				return Some(u);
-			}
-		}
-		None
-	}
-	fn send_to_all_in_convo(&mut self, convo_id: usize) -> Result<()> {
-		Ok(())
-	}
-	
+#[derive(Serialize, Deserialize)]
+struct Demessage {
+	usrid: usize,
+	convo: usize,
+	cmd: String,
+	txt: String,
+	start: usize,
+	end: usize,
 }
